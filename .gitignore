@@ -43,3 +43,6 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+
+# codex (personal, machine-specific settings - holds MCP access tokens)
+.codex/
