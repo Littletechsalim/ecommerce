@@ -16,7 +16,7 @@ const sourceSans = Source_Sans_3({
 });
 
 export const metadata: Metadata = {
-  title: "ShopWave — Premium Products",
+  title: "hello",
   description: "Discover top-rated products at unbeatable prices.",
 };
 
