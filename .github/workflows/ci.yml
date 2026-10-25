@@ -1,0 +1,130 @@
+name: CI
+
+# Runs on every merge into main (a PR merge lands as a push to main) and on the
+# pull request itself, so dev -> main is checked before and after the merge.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Lint, build, typecheck
+    runs-on: ubuntu-latest
+    env:
+      # next build prerenders cached Supabase reads (lib/products.ts), so the
+      # build needs a reachable project. Both values are the public, browser-side
+      # pair; set them as repository secrets.
+      NEXT_PUBLIC_SUPABASE_URL: ${{ secrets.NEXT_PUBLIC_SUPABASE_URL }}
+      NEXT_PUBLIC_SUPABASE_ANON_KEY: ${{ secrets.NEXT_PUBLIC_SUPABASE_ANON_KEY }}
+      NEXT_PUBLIC_SITE_URL: ${{ vars.NEXT_PUBLIC_SITE_URL || 'http://localhost:3000' }}
+      # Server-only secrets are never used while building, but lib/stripe.ts
+      # constructs the client at module scope and Stripe throws on an empty key.
+      # Placeholders keep real secrets out of CI.
+      STRIPE_SECRET_KEY: sk_test_ci_placeholder
+      STRIPE_WEBHOOK_SECRET: whsec_ci_placeholder
+      SUPABASE_SERVICE_ROLE_KEY: ci_placeholder
+      ADMIN_EMAILS: ci@example.com
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Fail early if Supabase secrets are missing
+        run: |
+          : "${NEXT_PUBLIC_SUPABASE_URL:?set the NEXT_PUBLIC_SUPABASE_URL repository secret}"
+          : "${NEXT_PUBLIC_SUPABASE_ANON_KEY:?set the NEXT_PUBLIC_SUPABASE_ANON_KEY repository secret}"
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - run: pnpm install --frozen-lockfile
+
+      - run: pnpm lint
+
+      # https://nextjs.org/docs/app/guides/ci-build-caching
+      - name: Restore Next.js build cache
+        uses: actions/cache@v4
+        with:
+          path: ${{ github.workspace }}/.next/cache
+          key: ${{ runner.os }}-nextjs-${{ hashFiles('pnpm-lock.yaml') }}-${{ hashFiles('**/*.ts', '**/*.tsx') }}
+          restore-keys: |
+            ${{ runner.os }}-nextjs-${{ hashFiles('pnpm-lock.yaml') }}-
+
+      - run: pnpm build
+
+      # After the build: next build generates next-env.d.ts and .next/types,
+      # which tsc needs to resolve the route and page types.
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - run: pnpm test
+
+  sql:
+    name: Supabase SQL check
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    env:
+      PGHOST: localhost
+      PGUSER: postgres
+      PGPASSWORD: postgres
+      PGDATABASE: postgres
+
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: Apply schema and migrations in order
+        run: |
+          set -euo pipefail
+          run_sql() { echo "--- $1"; psql -v ON_ERROR_STOP=1 -q -f "$1"; }
+          run_sql .github/ci/supabase-shim.sql
+          run_sql supabase/schema.sql
+          run_sql supabase/add_admin_role.sql
+          run_sql supabase/add_stripe_session.sql
+          run_sql supabase/add_stock_reservation.sql
+          run_sql supabase/seed_products.sql
+          run_sql supabase/seed_product_images.sql
+          run_sql supabase/set_test_stock.sql
+
+  secrets-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          fetch-depth: 0 # gitleaks scans the whole history, not just the tip
+
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.24.0 # bump by hand; pinned so a bad upstream release cannot break CI
+        run: |
+          set -euo pipefail
+          curl -sSfL "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz" \
+            | tar -xz gitleaks
+          ./gitleaks version
+
+      - name: Scan history for committed secrets
+        run: ./gitleaks git . --redact --verbose
